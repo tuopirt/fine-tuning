@@ -1,88 +1,95 @@
-# train_lora.py
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
-from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
+# train_lora_demo.py
+"""
+Tiny LoRA fine-tuning demo using distilgpt2 (CPU-friendly).
+1) loads model & tokenizer
+2) applies LoRA adapters via PEFT
+3) tokenizes the small dataset
+4) runs a short Trainer-based training loop
+"""
+
+from datasets import load_dataset                         # dataset utilities
+from transformers import (                                # model + training utils
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import torch
-import evaluate
 
 # ---- Config ----
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-OUTPUT_DIR = "./lora-output"
-BATCH_SIZE = 4   # per-GPU; lower if OOM
-EPOCHS = 3
+MODEL_NAME = "distilgpt2"  # tiny GPT-style model (fast on CPU)
+OUTPUT_DIR = "./lora-distilgpt2-demo"
+BATCH_SIZE = 2
+NUM_EPOCHS = 2
 LR = 2e-4
-MAX_LENGTH = 512
+MAX_LENGTH = 64
 
 # ---- Load dataset ----
-# Example: small alpaca dataset. Replace with your JSONL or dataset.
-dataset = load_dataset("yahma/alpaca-cleaned")  # small instruct dataset
-train = dataset["train"].select(range(500))     # quick subset for speed
-val = dataset["train"].select(range(500, 600))
+# We use our local JSONL file. `load_dataset` will parse it automatically.
+dataset = load_dataset("json", data_files={"train": "tests/test1.jsonl"}, split="train")
 
 # ---- Tokenizer & Model ----
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
-# Ensure tokenizer has pad token
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# GPT-style models often don't have a pad token — set one for batching
 if tokenizer.pad_token_id is None:
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    device_map="auto",
-    load_in_8bit=False,  # set True if you use bitsandbytes + limited VRAM
-    torch_dtype=torch.float16  # use fp16 if GPU supports it
-)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+model.resize_token_embeddings(len(tokenizer))  # make sure embeddings match tokenizer
 
-# ---- Prepare LoRA config ----
-peft_config = LoraConfig(
-    task_type=TaskType.CAUSAL_LM,
-    inference_mode=False,
-    r=8,            # low-rank dimension
-    lora_alpha=32,
+# Optional: prepare model for k-bit training if you plan to use quantization later
+# prepare_model_for_kbit_training(model)  # not necessary for CPU demo
+
+# ---- LoRA config & apply ----
+lora_config = LoraConfig(
+    r=8,              # low-rank dimension
+    lora_alpha=16,    # scaling factor
+    target_modules=["c_attn", "c_proj"],  # target GPT-style attention proj layers
     lora_dropout=0.05,
-    target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "dense"]  # typical targets; adapt per model
+    bias="none",
+    task_type="CAUSAL_LM",
 )
+model = get_peft_model(model, lora_config)
 
-model = get_peft_model(model, peft_config)
-
-# ---- Tokenize function ----
+# ---- Tokenization helper ----
 def preprocess(example):
-    prompt = f"### Instruction:\n{example['instruction']}\n\n### Response:\n"
-    target = example.get("output", "")
-    full = prompt + target
-    tokens = tokenizer(full, truncation=True, max_length=MAX_LENGTH, padding="max_length")
-    # set labels so loss only computed on response tokens: naive approach — use full labels (okay for this quick run)
+    # concatenate prompt + completion and tokenize as a single sequence
+    text = example["prompt"] + " " + example["completion"]
+    tokens = tokenizer(text, truncation=True, max_length=MAX_LENGTH, padding="max_length")
+    # For causal LM training, we want input_ids and labels identical (predict next token)
     tokens["labels"] = tokens["input_ids"].copy()
     return tokens
 
-train = train.map(preprocess, remove_columns=train.column_names)
-val = val.map(preprocess, remove_columns=val.column_names)
-train.set_format(type="torch")
-val.set_format(type="torch")
+tokenized = dataset.map(preprocess, remove_columns=dataset.column_names)
 
-# ---- Trainer ----
+# ---- Data collator ----
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+# ---- Training arguments ----
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=BATCH_SIZE,
-    per_device_eval_batch_size=BATCH_SIZE,
-    num_train_epochs=EPOCHS,
+    num_train_epochs=NUM_EPOCHS,
     learning_rate=LR,
-    fp16=True,
-    logging_steps=10,
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    save_total_limit=2,
-    remove_unused_columns=False
+    logging_steps=5,
+    save_steps=100,
+    fp16=False,  # CPU: keep float32
+    report_to=[]  # disable huggingface logging integrations for local run
 )
 
+# ---- Trainer (handles the training loop) ----
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=train,
-    eval_dataset=val,
-    tokenizer=tokenizer
+    train_dataset=tokenized,
+    data_collator=data_collator,
 )
 
 # ---- Train ----
 trainer.train()
-trainer.save_model(OUTPUT_DIR)
-print("LoRA fine-tune complete. Model saved to", OUTPUT_DIR)
+
+# ---- Save only LoRA adapters (small) ----
+model.save_pretrained(OUTPUT_DIR)  # saves adapter weights and config
+print("Saved LoRA adapters to:", OUTPUT_DIR)

@@ -1,0 +1,4 @@
+touch ~/.gitignore_global
+.venv/
+lora-distilgpt2-demo/checkpoint-4/
+lora-distilgpt2-demo/checkpoint-22/

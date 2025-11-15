@@ -28,7 +28,7 @@ MAX_LENGTH = 64
 
 # initations
 #dataset = load_dataset("json", data_files={"train": "tests/test1.jsonl"}, split="train")
-dataset = load_dataset("json", data_files={"train": "tests/test1.jsonl"}, split="train")
+dataset = load_dataset("json", data_files={"train": "data.jsonl"}, split="train")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
